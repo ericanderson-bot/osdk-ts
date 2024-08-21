@@ -75,6 +75,7 @@ export interface GithubContext {
   sha: string;
   branch: string;
   octokit: Octokit;
+  remoteToPush: string;
 }
 
 // GitHub Issues/PRs messages have a max size limit on the
@@ -117,6 +118,7 @@ export async function runVersion({
     || process.env.PRETEND_BRANCH?.startsWith("release/");
 
   const runGitCommands = !process.env.PRETEND_BRANCH;
+  const runPush = runGitCommands || process.env.FORCE_PUSH === "true";
 
   if (!isMainBranch && !isReleaseBranch) {
     throw new FailedWithUserMessage(
@@ -133,11 +135,16 @@ export async function runVersion({
     await gitUtils.reset(context.sha);
   }
 
+  consola.info(`Getting versions`);
   const originalVersionsByDirectory = await getVersionsByDirectory(cwd);
 
+  consola.info("Getting packages");
   const packages = await getPackages(cwd);
+
+  consola.info("Reading changeset config");
   const config = await readChangesetConfig(cwd, packages);
 
+  consola.info("Reading changesets and preState");
   const [changesets, preState] = await Promise.all([
     readChangesets(cwd),
     readPreState(cwd),
@@ -150,6 +157,7 @@ export async function runVersion({
     changelog: ["@changesets/changelog-git", null],
   };
 
+  consola.info("Assembling release plan");
   const releasePlan = assembleReleasePlan(
     changesets,
     packages,
@@ -165,8 +173,10 @@ export async function runVersion({
       : undefined,
   );
 
+  consola.info("Mutating release plan");
   mutateReleasePlan(releasePlan, isMainBranch ? "main" : "patch");
 
+  consola.info("Applying release plan");
   const touchedFiles = await applyReleasePlan(
     releasePlan,
     packages,
@@ -180,8 +190,10 @@ export async function runVersion({
     );
   }
 
+  consola.info("Running postVersionCmd");
   await exec("pnpm", ["run", "postVersionCmd"], { cwd });
 
+  consola.info("Getting changed packages info");
   const changedPackagesInfo = await getSortedChangedPackagesInfo(
     cwd,
     originalVersionsByDirectory,
@@ -189,7 +201,7 @@ export async function runVersion({
 
   const finalPrTitle = `${prTitle}${!!preState ? ` (${preState.tag})` : ""}`;
 
-  if (!runGitCommands) {
+  if (!runPush) {
     consola.warn("Skipping: commit, push, createPr");
   } else {
     // project with `commit: true` setting could have already committed files
@@ -204,7 +216,11 @@ export async function runVersion({
       await gitUtils.commitAll(finalCommitMessage);
     }
 
-    await gitUtils.push(versionBranch, { force: true });
+    consola.info("Pushing changes");
+    await gitUtils.push(`refs/heads/${versionBranch}`, {
+      force: true,
+      remote: context.remoteToPush,
+    });
 
     const prBody = await getVersionPrBody({
       hasPublishScript,
@@ -214,6 +230,7 @@ export async function runVersion({
       prBodyMaxCharacters,
     });
 
+    consola.info("Creating PR");
     await createOrUpdatePr(
       context,
       finalPrTitle,
